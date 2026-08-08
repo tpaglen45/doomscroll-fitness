@@ -868,6 +868,7 @@
             </div>
             <div class="utility-actions">
                 <button class="btn btn-secondary btn-sm" onclick="exportCSV()">CSV</button>
+                <button class="btn btn-secondary btn-sm" onclick="document.getElementById('csv-import-input').click()">Import CSV</button>
                 <button class="btn btn-secondary btn-sm" onclick="exportBackup()">Backup</button>
                 <button class="btn btn-secondary btn-sm" onclick="document.getElementById('backup-input').click()">Restore</button>
             </div>
@@ -966,6 +967,7 @@
 <!-- Hidden input used to capture/select a machine photo -->
 <input type="file" id="machine-photo-input" accept="image/*" capture="environment" style="display:none" onchange="handlePhotoFileSelected(event)">
 <input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="restoreBackup(event)">
+<input type="file" id="csv-import-input" accept="text/csv,.csv" style="display:none" onchange="importCsvFile(event)">
 
 <div class="timer-toast" id="timer-toast" role="status" aria-live="polite">
     <span class="timer-value" id="timer-value">1:30</span>
@@ -3263,6 +3265,31 @@ function downloadBlob(blob, filename) {
     link.download = filename;
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function importCsvFile(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        try {
+            const imported = AppCore.historyFromCsv(reader.result, PROGRAM);
+            if (imported.length === 0) throw new Error('No valid workout rows found in that file.');
+            const current = getHistory();
+            const before = current.length;
+            const merged = AppCore.mergeHistory(current, imported);
+            const added = merged.length - before;
+            if (!confirm(`Found ${imported.length} session(s) in this file. ${added} new session(s) will be added (duplicates by date and workout are skipped). Continue?`)) return;
+            saveHistory(merged);
+            location.reload();
+        } catch (error) {
+            alert(`Could not import that CSV: ${error.message}`);
+        } finally {
+            input.value = '';
+        }
+    };
+    reader.readAsText(file);
 }
 
 function exportBackup() {
