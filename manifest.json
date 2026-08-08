@@ -1,0 +1,18 @@
+{
+    "name": "Doomscroll Fitness",
+    "short_name": "DoomFit",
+    "description": "Weightlifting tracker for the 9-week Doomscroll Fitness program",
+    "start_url": "./",
+    "display": "standalone",
+    "background_color": "#f8fafc",
+    "theme_color": "#f8fafc",
+    "orientation": "portrait",
+    "icons": [
+        {
+            "src": "icon.png",
+            "sizes": "1254x1254",
+            "type": "image/png",
+            "purpose": "any maskable"
+        }
+    ]
+}
