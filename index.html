@@ -808,6 +808,23 @@
             align-items: center;
             flex-shrink: 0;
         }
+        .utility-actions { display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end; }
+        .timer-toast, .update-toast {
+            position: fixed; left: 50%; transform: translateX(-50%); z-index: 200;
+            background: var(--text); color: var(--bg); border-radius: 12px; padding: 10px 14px;
+            box-shadow: 0 8px 30px rgba(0,0,0,.25); display:none; align-items:center; gap:10px;
+        }
+        .timer-toast { bottom: 86px; }
+        .update-toast { top: 70px; }
+        .timer-toast.visible, .update-toast.visible { display:flex; }
+        .timer-value { font-size:20px; font-weight:800; min-width:58px; }
+        .dashboard { margin-bottom:18px; }
+        .dashboard-controls { display:flex; gap:8px; margin:10px 0; }
+        .dashboard-bars { display:flex; align-items:flex-end; gap:5px; height:110px; padding-top:10px; }
+        .dashboard-bar { flex:1; min-width:5px; background:var(--accent); border-radius:4px 4px 0 0; opacity:.8; }
+        .dashboard-summary { font-size:13px; color:var(--text-muted); line-height:1.5; }
+        .exercise-note { margin-top:8px; font-size:12px; color:var(--text-muted); font-style:italic; }
+        .session-date-input { width:100%; margin:8px 0 2px; }
     </style>
 </head>
 <body>
@@ -849,9 +866,11 @@
                 <div class="page-title">History</div>
                 <div class="page-subtitle">All past sessions</div>
             </div>
-            <button class="btn btn-secondary btn-sm" onclick="exportCSV()" style="margin-top:6px;flex-shrink:0;">
-                ⬇ Export CSV
-            </button>
+            <div class="utility-actions">
+                <button class="btn btn-secondary btn-sm" onclick="exportCSV()">CSV</button>
+                <button class="btn btn-secondary btn-sm" onclick="exportBackup()">Backup</button>
+                <button class="btn btn-secondary btn-sm" onclick="document.getElementById('backup-input').click()">Restore</button>
+            </div>
         </div>
         <div id="history-content"></div>
     </div>
@@ -946,6 +965,17 @@
 
 <!-- Hidden input used to capture/select a machine photo -->
 <input type="file" id="machine-photo-input" accept="image/*" capture="environment" style="display:none" onchange="handlePhotoFileSelected(event)">
+<input type="file" id="backup-input" accept="application/json,.json" style="display:none" onchange="restoreBackup(event)">
+
+<div class="timer-toast" id="timer-toast" role="status" aria-live="polite">
+    <span class="timer-value" id="timer-value">1:30</span>
+    <button class="btn btn-secondary btn-sm" onclick="addTimerSeconds(30)">+30s</button>
+    <button class="btn btn-secondary btn-sm" onclick="stopRestTimer()">Stop</button>
+</div>
+<div class="update-toast" id="update-toast" role="status">
+    <span>App update ready</span>
+    <button class="btn btn-secondary btn-sm" onclick="applyAppUpdate()">Update</button>
+</div>
 
 <!-- Tab bar -->
 <nav class="tab-bar">
@@ -967,6 +997,7 @@
     </button>
 </nav>
 
+<script src="app-core.js"></script>
 <script>
 // ════════════════════════════════════════════════════════════
 // WORKOUT PROGRAM
@@ -1877,11 +1908,40 @@ const state = {
 // ════════════════════════════════════════════════════════════
 
 function getHistory() {
-    return JSON.parse(localStorage.getItem('josh_program_history') || '[]');
+    return AppCore.safeJsonParse(localStorage.getItem('josh_program_history'), [], Array.isArray);
 }
 
 function saveHistory(h) {
     localStorage.setItem('josh_program_history', JSON.stringify(h));
+}
+
+// A session's (date, workout id) pair is stable even as the history array's indices shift
+// underneath it (deletions, other edits) — used instead of a raw array index so an in-progress
+// edit can never land on the wrong entry.
+function historyEntryKey(session) {
+    return `${session.date}|${session.id || session.type}`;
+}
+
+function findHistoryIndexByKey(history, key) {
+    return history.findIndex(session => historyEntryKey(session) === key);
+}
+
+const BUNDLED_HISTORY_VERSION = '2026-08-08';
+
+async function importBundledHistory() {
+    const versionKey = 'josh_program_bundled_history_version';
+    if (localStorage.getItem(versionKey) === BUNDLED_HISTORY_VERSION) return;
+
+    try {
+        const response = await fetch('./josh-program-2026-08-08.csv');
+        if (!response.ok) throw new Error(`History request failed: ${response.status}`);
+        const bundled = AppCore.historyFromCsv(await response.text(), PROGRAM);
+        const current = getHistory();
+        saveHistory(AppCore.mergeHistory(current, bundled));
+        localStorage.setItem(versionKey, BUNDLED_HISTORY_VERSION);
+    } catch (error) {
+        console.warn('Bundled workout history could not be imported.', error);
+    }
 }
 
 function getUnit() {
@@ -1893,8 +1953,7 @@ function saveUnit(u) {
 }
 
 function getNextWorkout() {
-    const h = getHistory();
-    return PROGRAM[h.length] || null;
+    return AppCore.getNextWorkout(PROGRAM, getHistory());
 }
 
 // ─── Active session persistence (so in-progress sets survive a closed tab) ───
@@ -1925,7 +1984,7 @@ function loadActiveSession() {
     const totalSets = Object.values(saved.sets || {}).reduce((acc, s) => acc + s.length, 0);
     if (totalSets > 0) {
         const history = getHistory();
-        history.push({
+        const recovered = {
             date: saved.scheduledDate || saved.startedAt,
             id: saved.id,
             type: saved.type,
@@ -1933,7 +1992,11 @@ function loadActiveSession() {
             week: saved.week,
             day: saved.day,
             sets: saved.sets,
-        });
+            swaps: saved.swaps || {},
+        };
+        const targetIndex = saved.editingKey ? findHistoryIndexByKey(history, saved.editingKey) : -1;
+        if (targetIndex !== -1) history.splice(targetIndex, 1, recovered);
+        else history.push(recovered);
         saveHistory(history);
     }
     localStorage.removeItem('josh_program_active_session');
@@ -1942,7 +2005,7 @@ function loadActiveSession() {
 // ─── Machine photos (one photo per exercise, keyed by its display name) ───
 
 function getMachinePhotos() {
-    return JSON.parse(localStorage.getItem('josh_program_machine_photos') || '{}');
+    return AppCore.safeJsonParse(localStorage.getItem('josh_program_machine_photos'), {}, value => value && typeof value === 'object' && !Array.isArray(value));
 }
 
 function saveMachinePhotos(map) {
@@ -1972,7 +2035,7 @@ function deleteMachinePhoto(name) {
 // ─── Bonus exercises (user-added extras that reappear whenever this workout recurs) ───
 
 function getBonusDefs() {
-    return JSON.parse(localStorage.getItem('josh_program_bonus_defs') || '{}');
+    return AppCore.safeJsonParse(localStorage.getItem('josh_program_bonus_defs'), {}, value => value && typeof value === 'object' && !Array.isArray(value));
 }
 
 function saveBonusDefs(defs) {
@@ -1999,6 +2062,24 @@ function removeBonusDef(workoutName, name) {
     saveBonusDefs(defs);
 }
 
+function getExerciseNotes() {
+    return AppCore.safeJsonParse(localStorage.getItem('josh_program_exercise_notes'), {}, value => value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function getExerciseNote(name) {
+    return getExerciseNotes()[name] || '';
+}
+
+function editExerciseNote(name) {
+    const notes = getExerciseNotes();
+    const next = prompt(`Setup notes for ${name}:`, notes[name] || '');
+    if (next === null) return;
+    if (next.trim()) notes[name] = next.trim().slice(0, 500);
+    else delete notes[name];
+    localStorage.setItem('josh_program_exercise_notes', JSON.stringify(notes));
+    renderWorkout();
+}
+
 // ─── Resolves how to log a given exercise: with weight, reps-only, or timed ───
 
 function resolveLogType(name, workoutName) {
@@ -2014,7 +2095,7 @@ function resolveLogType(name, workoutName) {
 // ─── Escaping for user-typed bonus exercise names ───
 
 function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    return AppCore.escapeHtml(str);
 }
 
 // Turns any exercise name into a string safe to use as a DOM id (getElementById lookups
@@ -2025,7 +2106,7 @@ function toSafeKey(name) {
 }
 
 function escapeForJsAttr(str) {
-    return String(str).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return AppCore.escapeInlineSingleQuoted(str);
 }
 
 function getWorkoutById(id) {
@@ -2047,7 +2128,9 @@ function targetSummary(exercise) {
 
 function getPrevSetsForExercise(name) {
     const h = getHistory();
+    const editingKey = state.activeSession && state.activeSession.editingKey;
     for (let i = h.length - 1; i >= 0; i--) {
+        if (editingKey && historyEntryKey(h[i]) === editingKey) continue; // don't compare a session against itself while editing it
         const s = h[i].sets && h[i].sets[name];
         if (s && s.length > 0) return s;
     }
@@ -2059,8 +2142,7 @@ function todayStr() {
 }
 
 function dateToStr(date) {
-    const local = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-    return local.toISOString().split('T')[0];
+    return AppCore.dateToStr(date);
 }
 
 function startOfWeek(date = new Date()) {
@@ -2102,15 +2184,11 @@ function setUnit(u) {
 function unitLabel() { return state.unit; }
 
 function convertWeight(w) {
-    // weights stored in lbs; convert to kg for display if needed
-    if (state.unit === 'kg') return Math.round(w * 0.453592 * 4) / 4; // round to nearest 0.25
-    return w;
+    return AppCore.convertWeight(w, state.unit);
 }
 
 function storeWeight(w) {
-    // always store in lbs
-    if (state.unit === 'kg') return Math.round(w / 0.453592 * 4) / 4;
-    return w;
+    return AppCore.storeWeight(w, state.unit);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2151,10 +2229,9 @@ function renderToday() {
 
     // Stats
     const totalSessions = history.length;
-    const thisWeek = history.filter(s => {
-        const diff = (Date.now() - new Date(s.date).getTime()) / 86400000;
-        return diff <= 7;
-    }).length;
+    const weekStart = dateToStr(startOfWeek());
+    const weekEnd = dateToStr(addDays(startOfWeek(), 6));
+    const thisWeek = history.filter(session => session.date >= weekStart && session.date <= weekEnd).length;
     const totalSets = history.reduce((acc, s) =>
         acc + Object.values(s.sets || {}).reduce((a, sets) => a + sets.length, 0), 0
     );
@@ -2269,7 +2346,7 @@ function renderToday() {
                         <div class="history-badge">W${session.week || getWorkoutById(session.id || session.type)?.week || ''}</div>
                     </div>
                     <div style="display:flex;flex-wrap:wrap;gap:6px;">
-                        ${exNames.map(n => `<span style="background:var(--card2);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--text-muted);">${n}</span>`).join('')}
+                        ${exNames.map(n => `<span style="background:var(--card2);border-radius:6px;padding:3px 9px;font-size:11px;color:var(--text-muted);">${escapeHtml(n)}</span>`).join('')}
                     </div>
                 </div>
             `;
@@ -2286,6 +2363,16 @@ function renderToday() {
 function startWorkout(id, scheduledDate = todayStr()) {
     const workout = getWorkoutById(id);
     if (!workout) return;
+    if (state.activeSession) {
+        const setCount = Object.values(state.activeSession.sets || {}).reduce((sum, sets) => sum + sets.length, 0);
+        const warning = setCount > 0
+            ? `Discard the active ${state.activeSession.name} workout and its ${setCount} logged sets?`
+            : `Discard the active ${state.activeSession.name} workout?`;
+        if (!confirm(warning)) {
+            switchTab('workout');
+            return;
+        }
+    }
     state.activeSession = {
         id,
         type: id,
@@ -2338,7 +2425,13 @@ function renderWorkout() {
         : workout ? `Week ${workout.week} ${workout.day}` : 'Log your sets below';
     document.getElementById('workout-view-sub').textContent = scheduledLabel;
 
-    let html = '';
+    let html = state.activeSession.editingKey ? `
+        <div class="card">
+            <div class="input-label">Workout date</div>
+            <input class="set-input session-date-input" type="date" value="${state.activeSession.scheduledDate || todayStr()}"
+                onchange="updateActiveSessionDate(this.value)">
+            <div class="dashboard-summary">Editing a completed session. Finish Workout saves changes in place.</div>
+        </div>` : '';
 
     workout.exercises.forEach(ex => {
         const swappedName = (state.activeSession.swaps || {})[ex.name];
@@ -2371,7 +2464,8 @@ function renderWorkout() {
                             <button class="camera-btn" onclick="triggerPhotoCapture('${escapeForJsAttr(activeName)}')" aria-label="${machinePhoto ? 'Retake' : 'Add'} machine photo for ${activeName}">📷</button>
                         </div>
                     </div>
-                    <div class="exercise-card-target">${targetSummary(ex)}</div>
+                    <div class="exercise-card-target">${targetSummary(ex)} · <button class="btn-swap-back" style="display:inline;width:auto;padding:3px 7px;margin:0;" onclick="editExerciseNote('${escapeForJsAttr(activeName)}')">Setup notes</button></div>
+                    ${getExerciseNote(activeName) ? `<div class="exercise-note">${escapeHtml(getExerciseNote(activeName))}</div>` : ''}
                     <div class="progress-dots">${dots}</div>
                     ${machinePhoto ? `<div class="machine-photo-row"><img class="machine-photo-thumb" src="${machinePhoto}" alt="Your ${activeName} machine" onclick="openPhotoView('${escapeForJsAttr(activeName)}')"></div>` : ''}
                 </div>
@@ -2397,7 +2491,7 @@ function renderWorkout() {
                 html += `
                     <div class="set-row">
                         <span class="set-num">${i + 1}</span>
-                        <span class="set-val">${disp}</span>
+                        <button class="set-val" style="background:none;border:0;color:inherit;font:inherit;padding:0;" onclick="editSet('${escapeForJsAttr(activeName)}', ${i})">${disp}</button>
                         ${repsCol}
                         <button class="delete-btn" onclick="deleteSet('${activeName}', ${i})">×</button>
                     </div>
@@ -2487,6 +2581,7 @@ function renderWorkout() {
             <div class="finish-card-title">Ready to wrap?</div>
             <div class="finish-card-sub">${totalSets} set${totalSets === 1 ? '' : 's'} logged so far. Finish when your last set is in.</div>
             <button class="btn btn-success" onclick="finishWorkout()">Finish Workout</button>
+            <button class="btn btn-secondary btn-sm" style="margin-top:8px;width:100%;" onclick="discardActiveWorkout()">Discard Workout</button>
         </div>
     `;
 
@@ -2630,6 +2725,14 @@ function handleAddBonusExercise(workoutName) {
         setTimeout(() => nameInput.classList.remove('error'), 800);
         return;
     }
+    const conflictsWithProgram = PROGRAM.some(workout => workout.name === workoutName &&
+        workout.exercises.some(exercise => exercise.name.toLowerCase() === name.toLowerCase()));
+    const conflictsWithInputId = state.activeSession && Object.keys(state.activeSession.sets || {}).some(existing =>
+        existing !== name && toSafeKey(existing) === toSafeKey(name));
+    if (conflictsWithProgram || conflictsWithInputId) {
+        alert('Choose a distinct name for this bonus exercise.');
+        return;
+    }
     const added = addBonusDef(workoutName, { name, type: typeSelect.value });
     if (!added) {
         alert(`"${name}" is already in this workout's bonus list.`);
@@ -2677,6 +2780,7 @@ function addSet(exerciseName) {
     const weightInLbs = needsWeight ? storeWeight(wVal) : 0;
     state.activeSession.sets[exerciseName].push({ weight: weightInLbs, reps: rVal });
     saveActiveSession();
+    startRestTimer();
     renderWorkout();
 
     // Scroll to bottom of the exercise card after adding
@@ -2684,6 +2788,37 @@ function addSet(exerciseName) {
         const inputs = document.querySelectorAll(`#w-${key}, #r-${key}`);
         if (inputs.length) inputs[0].scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     }, 50);
+}
+
+function editSet(exerciseName, index) {
+    const set = state.activeSession?.sets?.[exerciseName]?.[index];
+    if (!set) return;
+    const type = resolveLogType(exerciseName, state.activeSession.name);
+    if (type === 'weighted') {
+        const weight = prompt(`Weight (${unitLabel()}):`, convertWeight(set.weight));
+        if (weight === null) return;
+        const reps = prompt('Reps:', set.reps);
+        if (reps === null) return;
+        const parsedWeight = Number(weight);
+        const parsedReps = Number.parseInt(reps, 10);
+        if (!(parsedWeight > 0) || !(parsedReps > 0)) return alert('Enter a positive weight and rep count.');
+        set.weight = storeWeight(parsedWeight);
+        set.reps = parsedReps;
+    } else {
+        const value = prompt(type === 'timed' ? 'Seconds:' : 'Reps:', set.reps);
+        if (value === null) return;
+        const parsed = Number.parseInt(value, 10);
+        if (!(parsed > 0)) return alert('Enter a positive number.');
+        set.reps = parsed;
+    }
+    saveActiveSession();
+    renderWorkout();
+}
+
+function updateActiveSessionDate(value) {
+    if (!state.activeSession || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
+    state.activeSession.scheduledDate = value;
+    saveActiveSession();
 }
 
 function deleteSet(exerciseName, index) {
@@ -2741,15 +2876,31 @@ function finishWorkout() {
         week: state.activeSession.week,
         day: state.activeSession.day,
         sets: state.activeSession.sets,
+        swaps: state.activeSession.swaps || {},
     };
     const summary = getSessionSummary(completedSession);
-    history.push(completedSession);
+    const targetIndex = state.activeSession.editingKey ? findHistoryIndexByKey(history, state.activeSession.editingKey) : -1;
+    if (targetIndex !== -1) history.splice(targetIndex, 1, completedSession);
+    else history.push(completedSession);
     saveHistory(history);
 
     state.activeSession = null;
     saveActiveSession();
+    stopRestTimer();
     switchTab('today');
     showWorkoutSummary(summary);
+}
+
+function discardActiveWorkout() {
+    if (!state.activeSession) return;
+    const message = state.activeSession.editingKey
+        ? 'Discard these edits and keep the original completed session?'
+        : 'Discard this active workout and all logged sets?';
+    if (!confirm(message)) return;
+    state.activeSession = null;
+    saveActiveSession();
+    stopRestTimer();
+    switchTab('today');
 }
 
 // ════════════════════════════════════════════════════════════
@@ -2765,7 +2916,9 @@ function renderWeekReview() {
     const weekDates = trainingOffsets.map(offset => addDays(monday, offset));
     const weekDateStrings = weekDates.map(dateToStr);
     const completedThisWeek = history.filter(session => weekDateStrings.includes(session.date));
-    const startIndex = Math.max(0, history.length - completedThisWeek.length);
+    const nextWorkout = getNextWorkout();
+    const nextIndex = nextWorkout ? PROGRAM.indexOf(nextWorkout) : PROGRAM.length;
+    const startIndex = Math.max(0, nextIndex - completedThisWeek.length);
 
     document.getElementById('week-review-sub').textContent =
         `${formatDate(dateToStr(monday))} - ${formatDate(dateToStr(sunday))}`;
@@ -2838,7 +2991,7 @@ function renderWeekReview() {
 // HISTORY VIEW
 // ════════════════════════════════════════════════════════════
 
-function renderHistory() {
+function renderHistory(selectedExercise = '') {
     const container = document.getElementById('history-content');
     const history = getHistory();
     const reversed = history.slice().reverse();
@@ -2854,7 +3007,7 @@ function renderHistory() {
         return;
     }
 
-    let html = '';
+    let html = renderProgressDashboard(history, selectedExercise);
     reversed.forEach((session, i) => {
         const originalIndex = history.length - 1 - i;
         const exercises = Object.entries(session.sets || {});
@@ -2869,6 +3022,7 @@ function renderHistory() {
                     </div>
                     <div style="display:flex;align-items:center;gap:8px;">
                         <div class="history-badge">W${session.week || getWorkoutById(session.id || session.type)?.week || ''}</div>
+                        <button class="btn btn-secondary btn-sm" onclick="editSession(${originalIndex})" title="Edit session">Edit</button>
                         <button class="delete-btn" onclick="deleteSession(${originalIndex})" title="Delete session">🗑</button>
                     </div>
                 </div>
@@ -2911,6 +3065,49 @@ function renderHistory() {
     container.innerHTML = html;
 }
 
+function renderProgressDashboard(history, selectedExercise) {
+    const exerciseNames = Array.from(new Set(history.flatMap(session =>
+        Object.entries(session.sets || {}).filter(([, sets]) => sets.length).map(([name]) => name)
+    ))).sort();
+    const selected = exerciseNames.includes(selectedExercise) ? selectedExercise : exerciseNames[0];
+    // History is stored in append order, not date order (edited/made-up sessions can land
+    // out of sequence), so sort a copy chronologically before it drives "latest"/trend bars.
+    const chronological = history.slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    const points = chronological.filter(session => session.sets?.[selected]?.length).map(session => {
+        const sets = session.sets[selected];
+        const maxWeight = Math.max(...sets.map(set => set.weight || 0));
+        const volume = sets.reduce((sum, set) => sum + (set.weight || 0) * (set.reps || 0), 0);
+        const bestReps = Math.max(...sets.map(set => set.reps || 0));
+        return { date: session.date, maxWeight, volume, bestReps };
+    });
+    const maxValue = Math.max(1, ...points.map(point => point.maxWeight || point.bestReps));
+    const bars = points.slice(-12).map(point => {
+        const value = point.maxWeight || point.bestReps;
+        return `<div class="dashboard-bar" style="height:${Math.max(5, value / maxValue * 100)}%" title="${formatDate(point.date)}: ${value}"></div>`;
+    }).join('');
+    const latest = points[points.length - 1];
+    const bestWeight = Math.max(0, ...points.map(point => point.maxWeight));
+    const bestVolume = Math.max(0, ...points.map(point => point.volume));
+    const timerSeconds = Number(localStorage.getItem('josh_program_rest_seconds') || 90);
+
+    return `<div class="card dashboard">
+        <div class="card-section-title" style="margin:0;">Progress</div>
+        <div class="dashboard-controls">
+            <select class="set-input" onchange="renderHistory(this.value)">
+                ${exerciseNames.map(name => `<option value="${escapeHtml(name)}" ${name === selected ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('')}
+            </select>
+            <select class="set-input" aria-label="Rest timer" onchange="setRestDuration(this.value)">
+                <option value="0" ${timerSeconds === 0 ? 'selected' : ''}>Timer off</option>
+                <option value="60" ${timerSeconds === 60 ? 'selected' : ''}>60s rest</option>
+                <option value="90" ${timerSeconds === 90 ? 'selected' : ''}>90s rest</option>
+                <option value="120" ${timerSeconds === 120 ? 'selected' : ''}>120s rest</option>
+            </select>
+        </div>
+        <div class="dashboard-bars">${bars || '<div class="dashboard-summary">No exercise data yet.</div>'}</div>
+        ${latest ? `<div class="dashboard-summary">Latest: ${latest.maxWeight ? `${convertWeight(latest.maxWeight)} ${unitLabel()}` : `${latest.bestReps} reps`} · Best: ${bestWeight ? `${convertWeight(bestWeight)} ${unitLabel()}` : `${latest.bestReps} reps`} · Peak volume: ${Math.round(bestVolume)} lb-reps</div>` : ''}
+    </div>`;
+}
+
 // ════════════════════════════════════════════════════════════
 // HELPERS
 // ════════════════════════════════════════════════════════════
@@ -2923,6 +3120,22 @@ function deleteSession(index) {
     renderHistory();
     // Refresh today stats too if visible
     if (document.getElementById('view-today').classList.contains('active')) renderToday();
+}
+
+function editSession(index) {
+    const history = getHistory();
+    const session = history[index];
+    if (!session || !getWorkoutById(session.id || session.type)) return alert('This session is not linked to a program workout and cannot be edited here.');
+    if (state.activeSession && !confirm('Discard the current active workout and edit this completed session?')) return;
+    state.activeSession = JSON.parse(JSON.stringify({
+        ...session,
+        scheduledDate: session.date,
+        startedAt: todayStr(),
+        swaps: session.swaps || {},
+        editingKey: historyEntryKey(session)
+    }));
+    saveActiveSession();
+    switchTab('workout');
 }
 
 function getExerciseInfo(name) {
@@ -3043,6 +3256,52 @@ function formatDate(dateStr) {
     return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function exportBackup() {
+    const data = { format: 'doomscroll-fitness-backup', version: 1, exportedAt: new Date().toISOString(), storage: {} };
+    for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('josh_program_')) data.storage[key] = localStorage.getItem(key);
+    }
+    downloadBlob(
+        new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }),
+        `doomscroll-fitness-backup-${todayStr()}.json`
+    );
+}
+
+function restoreBackup(event) {
+    const input = event.target;
+    const file = input.files && input.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+        try {
+            const backup = JSON.parse(reader.result);
+            if (backup.format !== 'doomscroll-fitness-backup' || !backup.storage || typeof backup.storage !== 'object') {
+                throw new Error('Not a Doomscroll Fitness backup');
+            }
+            if (!confirm('Restore this backup? Current app data with matching keys will be replaced.')) return;
+            Object.entries(backup.storage).forEach(([key, value]) => {
+                if (key.startsWith('josh_program_') && typeof value === 'string') localStorage.setItem(key, value);
+            });
+            location.reload();
+        } catch (error) {
+            alert(`Could not restore backup: ${error.message}`);
+        } finally {
+            input.value = '';
+        }
+    };
+    reader.readAsText(file);
+}
+
 function exportCSV() {
     const history = getHistory();
     if (history.length === 0) {
@@ -3069,14 +3328,64 @@ function exportCSV() {
         });
     });
 
-    const csv = rows.map(r => r.map(v => `"${v}"`).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `josh-program-${new Date().toISOString().split('T')[0]}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const csv = rows.map(row => row.map(AppCore.csvCell).join(',')).join('\n');
+    downloadBlob(new Blob([csv], { type: 'text/csv' }), `josh-program-${todayStr()}.csv`);
+}
+
+let restTimerInterval = null;
+let restTimerRemaining = 0;
+
+function setRestDuration(value) {
+    localStorage.setItem('josh_program_rest_seconds', String(Number(value) || 0));
+}
+
+function startRestTimer() {
+    const seconds = Number(localStorage.getItem('josh_program_rest_seconds') || 90);
+    if (seconds <= 0) return;
+    restTimerRemaining = seconds;
+    clearInterval(restTimerInterval);
+    document.getElementById('timer-toast').classList.add('visible');
+    updateRestTimerDisplay();
+    restTimerInterval = setInterval(() => {
+        restTimerRemaining--;
+        updateRestTimerDisplay();
+        if (restTimerRemaining <= 0) {
+            clearInterval(restTimerInterval);
+            restTimerInterval = null;
+            if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+            document.getElementById('timer-value').textContent = 'Ready';
+        }
+    }, 1000);
+}
+
+function updateRestTimerDisplay() {
+    const minutes = Math.floor(Math.max(0, restTimerRemaining) / 60);
+    const seconds = Math.max(0, restTimerRemaining) % 60;
+    document.getElementById('timer-value').textContent = `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function addTimerSeconds(seconds) {
+    restTimerRemaining += seconds;
+    document.getElementById('timer-toast').classList.add('visible');
+    updateRestTimerDisplay();
+    if (!restTimerInterval) {
+        restTimerInterval = setInterval(() => {
+            restTimerRemaining--;
+            updateRestTimerDisplay();
+            if (restTimerRemaining <= 0) {
+                clearInterval(restTimerInterval);
+                restTimerInterval = null;
+                if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
+                document.getElementById('timer-value').textContent = 'Ready';
+            }
+        }, 1000);
+    }
+}
+
+function stopRestTimer() {
+    clearInterval(restTimerInterval);
+    restTimerInterval = null;
+    document.getElementById('timer-toast').classList.remove('visible');
 }
 
 // ════════════════════════════════════════════════════════════
@@ -3156,20 +3465,48 @@ state.unit = getUnit();
 document.getElementById(`unit-${state.unit}`).classList.add('active');
 document.getElementById(`unit-${state.unit === 'lbs' ? 'kg' : 'lbs'}`).classList.remove('active');
 
-// Resume any in-progress workout from earlier today
-loadActiveSession();
+let waitingServiceWorker = null;
+let reloadingForUpdate = false;
 
-// Register service worker for offline support
+function applyAppUpdate() {
+    if (waitingServiceWorker) waitingServiceWorker.postMessage('SKIP_WAITING');
+}
+
+// Register service worker for offline support and announce installed updates.
 if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('sw.js').catch(() => {});
+    navigator.serviceWorker.register('sw.js').then(registration => {
+        if (registration.waiting) {
+            waitingServiceWorker = registration.waiting;
+            document.getElementById('update-toast').classList.add('visible');
+        }
+        registration.addEventListener('updatefound', () => {
+            const worker = registration.installing;
+            if (!worker) return;
+            worker.addEventListener('statechange', () => {
+                if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+                    waitingServiceWorker = worker;
+                    document.getElementById('update-toast').classList.add('visible');
+                }
+            });
+        });
+    }).catch(() => {});
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (reloadingForUpdate) return;
+        reloadingForUpdate = true;
+        location.reload();
+    });
 }
 
 document.addEventListener('keydown', e => {
     if (e.key === 'Escape') { closeExerciseInfo(); closePhotoView(); }
 });
 
-// Initial render
-renderToday();
+// Seed a fresh install with the bundled CSV history before showing the app.
+importBundledHistory().finally(() => {
+    // Resume any in-progress workout from earlier today.
+    loadActiveSession();
+    renderToday();
+});
 </script>
 </body>
 </html>
