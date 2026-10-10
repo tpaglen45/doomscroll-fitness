@@ -246,6 +246,7 @@
             gap: 8px;
         }
         .btn:active { opacity: 0.7; transform: scale(0.97); }
+        .btn:disabled { opacity: 0.5; cursor: default; }
         .btn-primary { background: var(--accent); color: #fff; width: 100%; margin-top: 14px; }
         .btn-success { background: var(--success); color: #fff; width: 100%; }
         .btn-secondary { background: var(--card2); color: var(--text); }
@@ -815,7 +816,9 @@
             box-shadow: 0 8px 30px rgba(0,0,0,.25); display:none; align-items:center; gap:10px;
         }
         .timer-toast { bottom: 86px; }
-        .update-toast { top: 70px; }
+        .update-toast { top: 70px; white-space: nowrap; }
+        /* Settings shows its own update controls, so the toast would just cover them. */
+        body:has(#view-settings.active) .update-toast { display: none; }
         .timer-toast.visible, .update-toast.visible { display:flex; }
         .timer-value { font-size:20px; font-weight:800; min-width:58px; }
         .dashboard { margin-bottom:18px; }
@@ -825,6 +828,9 @@
         .dashboard-summary { font-size:13px; color:var(--text-muted); line-height:1.5; }
         .exercise-note { margin-top:8px; font-size:12px; color:var(--text-muted); font-style:italic; }
         .session-date-input { width:100%; margin:8px 0 2px; }
+        .settings-row { display:flex; justify-content:space-between; align-items:center; font-size:15px; margin-bottom:6px; }
+        .settings-value { color:var(--text-muted); font-variant-numeric:tabular-nums; }
+        .update-status { font-size:13px; color:var(--text-muted); line-height:1.5; min-height:20px; }
     </style>
 </head>
 <body>
@@ -874,6 +880,23 @@
             </div>
         </div>
         <div id="history-content"></div>
+    </div>
+
+    <!-- ── SETTINGS ── -->
+    <div id="view-settings" class="view">
+        <div class="page-header">
+            <div class="page-title">Settings</div>
+        </div>
+        <div class="card">
+            <div class="card-section-title">App Updates</div>
+            <div class="settings-row">
+                <span>Installed version</span>
+                <span class="settings-value" id="settings-version">…</span>
+            </div>
+            <div class="update-status" id="update-status" role="status" aria-live="polite"></div>
+            <button class="btn btn-primary" id="update-check-btn" onclick="checkForUpdates()">Check for Updates</button>
+            <button class="btn btn-success" id="update-install-btn" onclick="applyAppUpdate()" style="display:none;margin-top:14px;">Install Update &amp; Restart</button>
+        </div>
     </div>
 
     <!-- ── WEEK REVIEW ── -->
@@ -996,6 +1019,10 @@
     <button class="tab-btn" onclick="switchTab('week')" id="tab-week">
         <span class="tab-icon">🗓</span>
         Week
+    </button>
+    <button class="tab-btn" onclick="switchTab('settings')" id="tab-settings">
+        <span class="tab-icon">⚙️</span>
+        Settings
     </button>
 </nav>
 
@@ -2210,6 +2237,7 @@ function renderView(tab) {
     if (tab === 'workout') renderWorkout();
     if (tab === 'history') renderHistory();
     if (tab === 'week')    renderWeekReview();
+    if (tab === 'settings') renderSettings();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -3492,11 +3520,93 @@ state.unit = getUnit();
 document.getElementById(`unit-${state.unit}`).classList.add('active');
 document.getElementById(`unit-${state.unit === 'lbs' ? 'kg' : 'lbs'}`).classList.remove('active');
 
+let swRegistration = null;
 let waitingServiceWorker = null;
 let reloadingForUpdate = false;
+let checkingForUpdates = false;
 
 function applyAppUpdate() {
-    if (waitingServiceWorker) waitingServiceWorker.postMessage('SKIP_WAITING');
+    if (!waitingServiceWorker) return;
+    setUpdateStatus('Installing update…');
+    waitingServiceWorker.postMessage('SKIP_WAITING');
+}
+
+function announceUpdateReady(worker) {
+    waitingServiceWorker = worker;
+    document.getElementById('update-toast').classList.add('visible');
+    renderSettings();
+}
+
+// Ask a service worker for its VERSION (defined in sw.js) over a MessageChannel.
+function getWorkerVersion(worker) {
+    return new Promise(resolve => {
+        if (!worker) return resolve(null);
+        const channel = new MessageChannel();
+        const timeout = setTimeout(() => resolve(null), 1500);
+        channel.port1.onmessage = event => { clearTimeout(timeout); resolve(event.data); };
+        worker.postMessage('GET_VERSION', [channel.port2]);
+    });
+}
+
+function setUpdateStatus(text) {
+    document.getElementById('update-status').textContent = text;
+}
+
+async function renderSettings() {
+    const installBtn = document.getElementById('update-install-btn');
+    const checkBtn = document.getElementById('update-check-btn');
+    const versionEl = document.getElementById('settings-version');
+    checkBtn.disabled = checkingForUpdates;
+    checkBtn.style.display = waitingServiceWorker ? 'none' : '';
+    installBtn.style.display = waitingServiceWorker ? '' : 'none';
+    if (!('serviceWorker' in navigator)) {
+        versionEl.textContent = 'Unknown';
+        setUpdateStatus('Updates aren’t supported in this browser.');
+        checkBtn.disabled = true;
+        return;
+    }
+    const current = await getWorkerVersion(navigator.serviceWorker.controller);
+    versionEl.textContent = current || 'Unknown';
+    if (waitingServiceWorker) {
+        const next = await getWorkerVersion(waitingServiceWorker);
+        setUpdateStatus(`Update ${next ? `${next} ` : ''}downloaded and ready to install.`);
+    }
+}
+
+async function checkForUpdates() {
+    if (checkingForUpdates) return;
+    // register() may not have resolved yet right after launch, so fall back to looking it up.
+    if (!swRegistration && 'serviceWorker' in navigator) swRegistration = await navigator.serviceWorker.getRegistration() || null;
+    if (!swRegistration) {
+        setUpdateStatus('The app isn’t set up for offline updates yet. Reload and try again.');
+        return;
+    }
+    if (waitingServiceWorker) return renderSettings();
+    checkingForUpdates = true;
+    document.getElementById('update-check-btn').disabled = true;
+    setUpdateStatus('Checking for updates…');
+    try {
+        await swRegistration.update();
+        const installing = swRegistration.installing;
+        if (installing) {
+            setUpdateStatus('Downloading update…');
+            await new Promise(resolve => {
+                const done = () => { if (installing.state !== 'installing') resolve(); };
+                installing.addEventListener('statechange', done);
+                done();
+            });
+            if (installing.state === 'redundant') throw new Error('The download didn’t finish.');
+        }
+        if (swRegistration.waiting) announceUpdateReady(swRegistration.waiting);
+        else setUpdateStatus(`You’re up to date. Last checked ${new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.`);
+    } catch (error) {
+        setUpdateStatus(navigator.onLine === false
+            ? 'You’re offline. Connect to the internet and try again.'
+            : `Couldn’t check for updates: ${error.message || error}`);
+    } finally {
+        checkingForUpdates = false;
+        document.getElementById('update-check-btn').disabled = false;
+    }
 }
 
 // Register service worker for offline support and announce installed updates.
@@ -3504,18 +3614,13 @@ function applyAppUpdate() {
 // never waits on the CDN's Cache-Control max-age for sw.js — it's always checked fresh.
 if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(registration => {
-        if (registration.waiting) {
-            waitingServiceWorker = registration.waiting;
-            document.getElementById('update-toast').classList.add('visible');
-        }
+        swRegistration = registration;
+        if (registration.waiting) announceUpdateReady(registration.waiting);
         registration.addEventListener('updatefound', () => {
             const worker = registration.installing;
             if (!worker) return;
             worker.addEventListener('statechange', () => {
-                if (worker.state === 'installed' && navigator.serviceWorker.controller) {
-                    waitingServiceWorker = worker;
-                    document.getElementById('update-toast').classList.add('visible');
-                }
+                if (worker.state === 'installed' && navigator.serviceWorker.controller) announceUpdateReady(worker);
             });
         });
         registration.update().catch(() => {});
