@@ -1,4 +1,4 @@
-const VERSION = 'v7';
+const VERSION = 'v8';
 const CACHE = `doomscroll-fitness-${VERSION}`;
 const CACHE_PREFIX = 'doomscroll-fitness-';
 const CORE_ASSETS = ['./', './index.html', './app-core.js', './manifest.json', './icon.png'];

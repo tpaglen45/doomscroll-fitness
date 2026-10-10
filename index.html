@@ -437,6 +437,10 @@
         .bonus-add-row { display: grid; grid-template-columns: 1.3fr 1fr; gap: 10px; }
         .bonus-name-input { text-align: left; }
         .bonus-type-select { -webkit-appearance: none; appearance: none; }
+        .bonus-saved-select { width: 100%; text-align: left; margin-bottom: 10px; }
+        .bonus-or { font-size: 12px; color: var(--text-muted); margin: 2px 0 8px; }
+        .library-row { display:flex; justify-content:space-between; align-items:center; padding:8px 0; border-top:1px solid var(--border); font-size:15px; }
+        .library-type { font-size:12px; color:var(--text-muted); }
 
         /* ─── FINISH CARD ─── */
         .finish-card {
@@ -896,6 +900,10 @@
             <div class="update-status" id="update-status" role="status" aria-live="polite"></div>
             <button class="btn btn-primary" id="update-check-btn" onclick="checkForUpdates()">Check for Updates</button>
             <button class="btn btn-success" id="update-install-btn" onclick="applyAppUpdate()" style="display:none;margin-top:14px;">Install Update &amp; Restart</button>
+        </div>
+        <div class="card">
+            <div class="card-section-title">Saved Exercises</div>
+            <div id="exercise-library"></div>
         </div>
     </div>
 
@@ -2084,6 +2092,41 @@ function addBonusDef(workoutName, def) {
     return true;
 }
 
+// Every bonus exercise you've ever added, so it can be picked from a list in any workout.
+const BONUS_TYPE_LABELS = { weighted: 'Weight + Reps', reps: 'Reps only', timed: 'Timed' };
+
+function getExerciseLibrary() {
+    const raw = localStorage.getItem('josh_program_exercise_library');
+    if (raw === null) {
+        // First run: seed from bonus exercises already added to workouts.
+        const seeded = [];
+        Object.values(getBonusDefs()).flat().forEach(def => {
+            if (def && def.name && !seeded.some(d => d.name.toLowerCase() === def.name.toLowerCase())) seeded.push({ name: def.name, type: def.type });
+        });
+        saveExerciseLibrary(seeded);
+        return seeded;
+    }
+    return AppCore.safeJsonParse(raw, [], Array.isArray);
+}
+
+function saveExerciseLibrary(list) {
+    list.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    localStorage.setItem('josh_program_exercise_library', JSON.stringify(list));
+}
+
+function rememberExercise(def) {
+    const list = getExerciseLibrary();
+    if (list.some(d => d.name.toLowerCase() === def.name.toLowerCase())) return;
+    list.push({ name: def.name, type: def.type });
+    saveExerciseLibrary(list);
+}
+
+function forgetExercise(name) {
+    if (!confirm(`Remove "${name}" from your saved exercises? It stays in any workout it's already added to, and logged sets stay in your history.`)) return;
+    saveExerciseLibrary(getExerciseLibrary().filter(d => d.name !== name));
+    renderSettings();
+}
+
 function removeBonusDef(workoutName, name) {
     const defs = getBonusDefs();
     if (!defs[workoutName]) return;
@@ -2728,9 +2771,18 @@ function renderBonusSection(workout, sets) {
         html += `</div>`; // close bonus card
     });
 
+    const inWorkout = new Set(bonusList.map(b => b.name.toLowerCase()));
+    const saved = getExerciseLibrary().filter(d => !inWorkout.has(d.name.toLowerCase()));
+    const savedPicker = saved.length === 0 ? '' : `
+            <select class="set-input bonus-saved-select" onchange="handlePickSavedExercise('${escapeForJsAttr(workout.name)}', this)">
+                <option value="">Choose a saved exercise…</option>
+                ${saved.map(d => `<option value="${escapeHtml(d.name)}">${escapeHtml(d.name)} · ${BONUS_TYPE_LABELS[d.type] || ''}</option>`).join('')}
+            </select>
+            <div class="bonus-or">or add a new one:</div>`;
+
     html += `
         <div class="bonus-add-card">
-            <div class="bonus-add-title">+ Add a bonus exercise</div>
+            <div class="bonus-add-title">+ Add a bonus exercise</div>${savedPicker}
             <div class="bonus-add-row">
                 <input class="set-input bonus-name-input" type="text" placeholder="e.g. Plank" id="bonus-new-name">
                 <select class="set-input bonus-type-select" id="bonus-new-type">
@@ -2755,25 +2807,40 @@ function handleAddBonusExercise(workoutName) {
         setTimeout(() => nameInput.classList.remove('error'), 800);
         return;
     }
+    // Typing the name of a saved exercise reuses its saved spelling and type.
+    const savedMatch = getExerciseLibrary().find(d => d.name.toLowerCase() === name.toLowerCase());
+    if (!addBonusExercise(workoutName, savedMatch || { name, type: typeSelect.value })) return;
+    nameInput.value = '';
+    renderWorkout();
+}
+
+function handlePickSavedExercise(workoutName, select) {
+    const def = getExerciseLibrary().find(d => d.name === select.value);
+    if (!def) return;
+    if (addBonusExercise(workoutName, def)) renderWorkout();
+    else select.value = '';
+}
+
+function addBonusExercise(workoutName, def) {
+    const name = def.name;
     const conflictsWithProgram = PROGRAM.some(workout => workout.name === workoutName &&
         workout.exercises.some(exercise => exercise.name.toLowerCase() === name.toLowerCase()));
     const conflictsWithInputId = state.activeSession && Object.keys(state.activeSession.sets || {}).some(existing =>
         existing !== name && toSafeKey(existing) === toSafeKey(name));
     if (conflictsWithProgram || conflictsWithInputId) {
         alert('Choose a distinct name for this bonus exercise.');
-        return;
+        return false;
     }
-    const added = addBonusDef(workoutName, { name, type: typeSelect.value });
-    if (!added) {
+    if (!addBonusDef(workoutName, { name, type: def.type })) {
         alert(`"${name}" is already in this workout's bonus list.`);
-        return;
+        return false;
     }
+    rememberExercise(def);
     if (state.activeSession && !state.activeSession.sets[name]) {
         state.activeSession.sets[name] = [];
         saveActiveSession();
     }
-    nameInput.value = '';
-    renderWorkout();
+    return true;
 }
 
 function removeBonusExercise(workoutName, name) {
@@ -3553,6 +3620,14 @@ function setUpdateStatus(text) {
 }
 
 async function renderSettings() {
+    const library = getExerciseLibrary();
+    document.getElementById('exercise-library').innerHTML = library.length === 0
+        ? `<div class="update-status">Bonus exercises you add to a workout are saved here so you can pick them in any workout.</div>`
+        : library.map(d => `
+            <div class="library-row">
+                <div>${escapeHtml(d.name)} <span class="library-type">· ${BONUS_TYPE_LABELS[d.type] || ''}</span></div>
+                <button class="delete-btn" onclick="forgetExercise('${escapeForJsAttr(d.name)}')" aria-label="Remove ${escapeHtml(d.name)} from saved exercises">×</button>
+            </div>`).join('');
     const installBtn = document.getElementById('update-install-btn');
     const checkBtn = document.getElementById('update-check-btn');
     const versionEl = document.getElementById('settings-version');
